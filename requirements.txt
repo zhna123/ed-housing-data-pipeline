@@ -1,0 +1,10 @@
+# Uncomment to enable Azure Monitor OpenTelemetry
+# Ref: aka.ms/functions-azure-monitor-python
+# azure-monitor-opentelemetry
+
+azure-functions
+pandas
+openpyxl
+pyarrow  # required for pandas.to_parquet
+azure-identity
+azure-storage-file-datalake
