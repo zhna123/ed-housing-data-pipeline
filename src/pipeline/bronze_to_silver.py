@@ -1,18 +1,19 @@
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
 from io import BytesIO
-import os
-import datetime
 
 import pandas as pd
 
-from silver_to_gold import build_lea_joined_gold
-from storage_io import load_storage_config, read_bytes, write_bytes
-
-
-def _ingest_date() -> str:
-    # Expected format: YYYY-MM-DD
-    return (os.getenv("INGEST_DATE") or datetime.date.today().isoformat()).strip()
+from data_util.pipeline_common import get_ingest_date, get_pipeline_logger, get_run_id, write_report
+from data_util.quality import basic_stats
+from data_util.storage_io import (
+    load_storage_config,
+    list_dir_files,
+    read_bytes,
+    write_partitioned_parquet,
+)
 
 
 def _paths(ingest_date: str) -> Dict[str, str]:
@@ -20,15 +21,40 @@ def _paths(ingest_date: str) -> Dict[str, str]:
     Canonical lake-style paths (works for local + ADLS because we always use relative paths).
     """
     return {
-        # Filenames intentionally match the existing local repo filenames.
-        "bronze_housing": f"bronze/housing_affordability/ingest_date={ingest_date}/housing2019-23.csv",
-        "bronze_special": f"bronze/special_education/ingest_date={ingest_date}/special_education2022-23.csv",
-        "bronze_school": f"bronze/school_performance/ingest_date={ingest_date}/school_performance.xlsx",
-        "silver_housing": f"silver/housing_affordability/ingest_date={ingest_date}/housing2019-23.parquet",
-        "silver_special": f"silver/special_education/ingest_date={ingest_date}/special_education2022-23.parquet",
-        "silver_school": f"silver/school_performance/ingest_date={ingest_date}/school_performance2023.parquet",
-        "gold_analysis": f"gold/county_analysis/ingest_date={ingest_date}/county_joined.parquet",
+        "bronze_housing_partition": (
+            f"bronze/housing_affordability/ingest_date={ingest_date}"
+        ),
+        "bronze_special_partition": (
+            f"bronze/special_education/ingest_date={ingest_date}"
+        ),
+        "bronze_school_partition": (
+            f"bronze/school_performance/ingest_date={ingest_date}"
+        ),
+        "silver_housing": f"silver/housing_affordability/ingest_date={ingest_date}",
+        "silver_special": f"silver/special_education/ingest_date={ingest_date}",
+        "silver_school": f"silver/school_performance/ingest_date={ingest_date}",
+        "gold_analysis": f"gold/county_analysis/ingest_date={ingest_date}",
     }
+
+
+def _read_partitioned_parquet(cfg, relative_dir: str) -> pd.DataFrame:
+    try:
+        files = [name for name in list_dir_files(cfg, relative_dir) if name.endswith(".parquet")]
+    except Exception as e:
+        # Handle case where directory doesn't exist
+        raise FileNotFoundError(f"Directory {relative_dir!r} not found or inaccessible: {e}")
+    
+    if not files:
+        raise FileNotFoundError(f"No parquet files found under {relative_dir!r}")
+
+    frames = []
+    for name in files:
+        data = read_bytes(cfg, f"{relative_dir}/{name}")
+        frames.append(pd.read_parquet(BytesIO(data)))
+
+    if len(frames) == 1:
+        return frames[0]
+    return pd.concat(frames, ignore_index=True)
 
 
 def build_silver_frames(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -39,28 +65,16 @@ def build_silver_frames(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.
       - special_clean
     """
     cfg = load_storage_config(base_dir)
-    ingest_date = _ingest_date()
+    ingest_date = get_ingest_date()
     p = _paths(ingest_date)
 
-    # --- Load raw (bronze) data -------------------------------------------------
-    housing_path = p["bronze_housing"]
-    special_path = p["bronze_special"]
-    school_path = p["bronze_school"]
-
-    housing_raw = pd.read_csv(BytesIO(read_bytes(cfg, housing_path)))
-
-    school_raw = pd.read_excel(
-        BytesIO(read_bytes(cfg, school_path)),
-        engine="openpyxl",
-    )
-
-    # Special education CSV has metadata rows above the real header; use header row at index 4.
-    special_raw = pd.read_csv(BytesIO(read_bytes(cfg, special_path)), header=4)
+    housing_raw = _read_partitioned_parquet(cfg, p["bronze_housing_partition"])
+    school_raw = _read_partitioned_parquet(cfg, p["bronze_school_partition"])
+    special_raw = _read_partitioned_parquet(cfg, p["bronze_special_partition"])
 
     # --- Clean / transform data -------------------------------------------------
 
     # Housing dataset cleaning
-    # Drop the ACS metadata row (where GEO_ID == 'Geography') before selecting/renaming columns.
     housing_clean = housing_raw[housing_raw["GEO_ID"] != "Geography"][
         [
             "GEO_ID",
@@ -84,7 +98,6 @@ def build_silver_frames(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.
         }
     ).reset_index(drop=True)
 
-    # Ensure numeric types for cost-burden and occupied-units columns.
     housing_numeric_cols = [
         "occupied_housing_units",
         "inc_lt_20k_cost_burden_30_plus",
@@ -97,8 +110,6 @@ def build_silver_frames(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.
         pd.to_numeric, errors="coerce"
     )
 
-    # Total share of occupied housing units that are cost-burdened (30%+ of income),
-    # combining all specified income tiers.
     income_burden_cols = [
         "inc_lt_20k_cost_burden_30_plus",
         "inc_20k_34_999_cost_burden_30_plus",
@@ -123,6 +134,9 @@ def build_silver_frames(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.
             "single_score_23": "ccrpi_score_2023",
         }
     ).reset_index(drop=True)
+    school_clean["ccrpi_score_2023"] = pd.to_numeric(
+        school_clean["ccrpi_score_2023"], errors="coerce"
+    )
 
     # Special education dataset cleaning (IDEA environments)
     special_clean = special_raw[
@@ -142,7 +156,6 @@ def build_silver_frames(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.
         }
     )
 
-    # Ensure numeric types for environment counts.
     special_numeric_cols = [
         "total_swd",
         "School Age Inside regular class 80% or more of the day",
@@ -151,7 +164,6 @@ def build_silver_frames(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.
         pd.to_numeric, errors="coerce"
     )
 
-    # Share of students with disabilities who are inside regular class 80%+ of the day.
     special_clean["pct_inclusive_80_plus"] = (
         special_clean["School Age Inside regular class 80% or more of the day"]
         / special_clean["total_swd"].replace({0: pd.NA})
@@ -168,119 +180,118 @@ def run_bronze_to_silver(base_dir: Path) -> Dict[str, Any]:
     """
     Orchestrates reading the three bronze datasets, cleaning them,
     and writing Parquet outputs to the silver layer.
-
-    Parameters
-    ----------
-    base_dir:
-        The root directory of the Azure Function app (directory
-        containing function_app.py). The data folders are expected
-        under ``base_dir / 'data'``.
-
-    Returns
-    -------
-    dict
-        Simple summary including row counts and output file paths.
     """
     cfg = load_storage_config(base_dir)
-    ingest_date = _ingest_date()
+    logger = get_pipeline_logger(base_dir, logger_name="bronze_to_silver")
+    run_id = get_run_id()
+    ingest_date = get_ingest_date()
     p = _paths(ingest_date)
     housing_clean, school_clean, special_clean = build_silver_frames(base_dir)
 
-    # --- Write cleaned data to silver as Parquet --------------------------------
     housing_out = p["silver_housing"]
     school_out = p["silver_school"]
     special_out = p["silver_special"]
 
-    buf = BytesIO()
-    housing_clean.to_parquet(buf, index=False)
-    write_bytes(cfg, housing_out, buf.getvalue())
+    housing_clean = housing_clean.copy()
+    school_clean = school_clean.copy()
+    special_clean = special_clean.copy()
+    housing_clean["ingest_date"] = ingest_date
+    school_clean["ingest_date"] = ingest_date
+    special_clean["ingest_date"] = ingest_date
 
-    buf = BytesIO()
-    school_clean.to_parquet(buf, index=False)
-    write_bytes(cfg, school_out, buf.getvalue())
+    write_partitioned_parquet(
+        cfg,
+        relative_path="silver/housing_affordability",
+        df=housing_clean,
+        schema=None,
+        partition_cols=["ingest_date"],
+        overwrite_partition_path=housing_out,
+    )
+    housing_report = f"silver/housing_affordability/ingest_date={ingest_date}/report.json"
+    write_report(
+        cfg,
+        relative_path=housing_report,
+        payload={
+            "stage": "bronze_to_silver",
+            "dataset": "housing_affordability",
+            "ingest_date": ingest_date,
+            "run_id": run_id,
+            "quality": basic_stats(housing_clean),
+            "output_path": housing_out,
+        },
+    )
 
-    buf = BytesIO()
-    special_clean.to_parquet(buf, index=False)
-    write_bytes(cfg, special_out, buf.getvalue())
+    write_partitioned_parquet(
+        cfg,
+        relative_path="silver/school_performance",
+        df=school_clean,
+        schema=None,
+        partition_cols=["ingest_date"],
+        overwrite_partition_path=school_out,
+    )
+    school_report = f"silver/school_performance/ingest_date={ingest_date}/report.json"
+    write_report(
+        cfg,
+        relative_path=school_report,
+        payload={
+            "stage": "bronze_to_silver",
+            "dataset": "school_performance",
+            "ingest_date": ingest_date,
+            "run_id": run_id,
+            "quality": basic_stats(school_clean),
+            "output_path": school_out,
+        },
+    )
+
+    write_partitioned_parquet(
+        cfg,
+        relative_path="silver/special_education",
+        df=special_clean,
+        schema=None,
+        partition_cols=["ingest_date"],
+        overwrite_partition_path=special_out,
+    )
+    special_report = f"silver/special_education/ingest_date={ingest_date}/report.json"
+    write_report(
+        cfg,
+        relative_path=special_report,
+        payload={
+            "stage": "bronze_to_silver",
+            "dataset": "special_education",
+            "ingest_date": ingest_date,
+            "run_id": run_id,
+            "quality": basic_stats(special_clean),
+            "output_path": special_out,
+        },
+    )
+
+    logger.info(
+        "bronze_to_silver completed",
+        extra={
+            "ingest_date": ingest_date,
+            "run_id": run_id,
+            "reports": [housing_report, school_report, special_report],
+        },
+    )
 
     return {
         "housing": {
             "rows": int(housing_clean.shape[0]),
             "columns": int(housing_clean.shape[1]),
             "output_path": housing_out,
+            "report_path": housing_report,
         },
         "school": {
             "rows": int(school_clean.shape[0]),
             "columns": int(school_clean.shape[1]),
             "output_path": school_out,
+            "report_path": school_report,
         },
         "special_education": {
             "rows": int(special_clean.shape[0]),
             "columns": int(special_clean.shape[1]),
             "output_path": special_out,
-        },
-    }
-
-
-def run_bronze_to_silver_and_gold(base_dir: Path) -> Dict[str, Any]:
-    """
-    Single-run pipeline:
-      bronze -> (clean in-memory) -> write silver -> build gold from the same frames -> write gold.
-    """
-    cfg = load_storage_config(base_dir)
-    ingest_date = _ingest_date()
-    p = _paths(ingest_date)
-
-    housing_clean, school_clean, special_clean = build_silver_frames(base_dir)
-
-    # Write silver
-    housing_out = p["silver_housing"]
-    school_out = p["silver_school"]
-    special_out = p["silver_special"]
-
-    buf = BytesIO()
-    housing_clean.to_parquet(buf, index=False)
-    write_bytes(cfg, housing_out, buf.getvalue())
-
-    buf = BytesIO()
-    school_clean.to_parquet(buf, index=False)
-    write_bytes(cfg, school_out, buf.getvalue())
-
-    buf = BytesIO()
-    special_clean.to_parquet(buf, index=False)
-    write_bytes(cfg, special_out, buf.getvalue())
-
-    # Build + write gold (in-memory join; no parquet re-read)
-    gold_df = build_lea_joined_gold(housing=housing_clean, school=school_clean, special=special_clean)
-    gold_out = p["gold_analysis"]
-    buf = BytesIO()
-    gold_df.to_parquet(buf, index=False)
-    write_bytes(cfg, gold_out, buf.getvalue())
-
-    return {
-        "silver": {
-            "housing": {
-                "rows": int(housing_clean.shape[0]),
-                "columns": int(housing_clean.shape[1]),
-                "output_path": housing_out,
-            },
-            "school": {
-                "rows": int(school_clean.shape[0]),
-                "columns": int(school_clean.shape[1]),
-                "output_path": school_out,
-            },
-            "special_education": {
-                "rows": int(special_clean.shape[0]),
-                "columns": int(special_clean.shape[1]),
-                "output_path": special_out,
-            },
-        },
-        "gold": {
-            "county_joined": {
-                "rows": int(gold_df.shape[0]),
-                "columns": int(gold_df.shape[1]),
-                "output_path": gold_out,
-            }
+            "report_path": special_report,
         },
     }
 
@@ -289,15 +300,12 @@ if __name__ == "__main__":
     """
     Simple local runner to test the bronze -> silver pipeline
     without going through Azure Functions.
-
-    Usage (from project root):
-        python bronze_to_silver.py
+    Usage:
+        PYTHONPATH=src python -m pipeline.bronze_to_silver
     """
-    base_dir = Path(__file__).parent
+    base_dir = Path(__file__).resolve().parents[2]
     summary = run_bronze_to_silver(base_dir)
 
-    # Pretty-print a compact summary to the console.
-    import json as _json  # local import to avoid polluting module namespace
+    import json as _json
 
     print(_json.dumps(summary, indent=2))
-

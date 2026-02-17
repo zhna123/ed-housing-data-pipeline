@@ -1,0 +1,14 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "PIPELINE_STORAGE_MODE": "local",
+    "INGEST_DATE": "YYYY-MM-DD",
+    "ADLS_ACCOUNT_URL": "https://<account>.dfs.core.windows.net",
+    "ADLS_FILE_SYSTEM": "<container>",
+    "ADLS_BASE_PATH": "data",
+    "AZURE_STORAGE_CONNECTION_STRING": "<optional-for-local-dev>"
+  }
+}
+

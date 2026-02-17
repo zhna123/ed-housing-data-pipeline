@@ -20,9 +20,13 @@ project.lock.json
 /App_Data
 /secrets
 /data
+/logs
 .secrets
 appsettings.json
 local.settings.json
+local.settings.*.json
+!local.settings.example.json
+pipeline_state.json
 
 node_modules
 dist
@@ -32,6 +36,9 @@ dist
 
 # Python Environments
 .env
+.env.*
+.envrc
+!.env.example
 .venv
 env/
 venv/
@@ -48,6 +55,9 @@ __pycache__/
 __blobstorage__
 __queuestorage__
 __azurite_db*__.json
+
+# Logs
+*.log
 
 # OS / editor
 .DS_Store
@@ -67,6 +77,13 @@ __azurite_db*__.json
 *.duckdb
 *.duckdb.wal
 *.duckdb.tmp
+
+# Local databases (avoid accidental commits)
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
 
 # Common secret/key/cert formats (avoid accidental commits)
 *.pem
